@@ -6,10 +6,12 @@ Collects bug bounty and vulnerability disclosure program domains from multiple
 public sources. Supports interactive source selection and outputs a deduplicated
 domain list.
 
-Can be run standalone or as a module within the recon_framework.
+Usage:
+    python3 extractor.py                        # Interactive menu
+    python3 extractor.py -s 1,2,7               # Select specific sources
+    python3 extractor.py -s 0 -o targets.txt    # All sources, custom output
 """
 
-import os
 import sys
 import re
 import csv
@@ -18,7 +20,6 @@ import json
 import time
 import logging
 import argparse
-from datetime import datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,28 +32,27 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SOURCES = {
-    1:  {"name": "Bounty Targets Data",   "desc": "domains.txt + wildcards (arkadiyt/bounty-targets-data)"},
-    2:  {"name": "HackerOne Programs",     "desc": "in-scope targets from HackerOne"},
-    3:  {"name": "Bugcrowd Programs",      "desc": "in-scope targets from Bugcrowd"},
-    4:  {"name": "Intigriti Programs",     "desc": "in-scope targets from Intigriti"},
-    5:  {"name": "YesWeHack Programs",     "desc": "in-scope targets from YesWeHack"},
-    6:  {"name": "Federacy Programs",      "desc": "in-scope targets from Federacy"},
-    7:  {"name": "Disclose.io Database",   "desc": "vulnerability disclosure programs"},
+    1:  {"name": "Bounty Targets Data",     "desc": "domains.txt + wildcards (arkadiyt/bounty-targets-data)"},
+    2:  {"name": "HackerOne Programs",       "desc": "in-scope targets from HackerOne"},
+    3:  {"name": "Bugcrowd Programs",        "desc": "in-scope targets from Bugcrowd"},
+    4:  {"name": "Intigriti Programs",       "desc": "in-scope targets from Intigriti"},
+    5:  {"name": "YesWeHack Programs",       "desc": "in-scope targets from YesWeHack"},
+    6:  {"name": "Federacy Programs",        "desc": "in-scope targets from Federacy"},
+    7:  {"name": "Disclose.io Database",     "desc": "vulnerability disclosure programs"},
     8:  {"name": "Chaos (ProjectDiscovery)", "desc": "public bug bounty recon data"},
-    9:  {"name": "CISA VDP Directory",     "desc": "US gov vulnerability disclosure policies"},
-    10: {"name": "Google Dorking",         "desc": "search for 'bug bounty' / 'responsible disclosure' pages"},
-    11: {"name": "Security.txt Scraper",   "desc": "check domains for /.well-known/security.txt"},
+    9:  {"name": "CISA VDP Directory",       "desc": "US gov vulnerability disclosure policies"},
+    10: {"name": "Google Dorking",           "desc": "search for 'bug bounty' / 'responsible disclosure' pages"},
+    11: {"name": "Security.txt Scraper",     "desc": "check domains for /.well-known/security.txt"},
 }
 
 PLATFORM_URLS = {
     2: ("hackerone",  "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/hackerone_data.json"),
     3: ("bugcrowd",   "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/bugcrowd_data.json"),
     4: ("intigriti",  "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/intigriti_data.json"),
-    5: ("yeswehack", "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/yeswehack_data.json"),
+    5: ("yeswehack",  "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/yeswehack_data.json"),
     6: ("federacy",   "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/federacy_data.json"),
 }
 
-# Google dork queries for discovering disclosure pages
 GOOGLE_DORKS = [
     'inurl:"responsible-disclosure"',
     'inurl:"bug-bounty"',
@@ -61,7 +61,6 @@ GOOGLE_DORKS = [
     'intext:"report a vulnerability" inurl:security',
 ]
 
-# Common security.txt paths
 SECURITY_TXT_PATHS = [
     "/.well-known/security.txt",
     "/security.txt",
@@ -72,7 +71,7 @@ SECURITY_TXT_PATHS = [
 # ---------------------------------------------------------------------------
 
 def make_request(url, timeout=30):
-    """Make an HTTP GET request with error handling and retry."""
+    """Make an HTTP GET request with error handling and one retry on timeout."""
     headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
     for attempt in range(2):
         try:
@@ -97,7 +96,6 @@ def extract_domain(url):
     url = url.strip()
     if not url:
         return None
-    # Add scheme if missing so urlparse works
     if not re.match(r'^https?://', url, re.IGNORECASE):
         url = "https://" + url
     try:
@@ -115,16 +113,12 @@ def clean_domain(domain):
     if not domain:
         return None
     domain = domain.strip().lower()
-    # Strip wildcard prefix
     domain = re.sub(r'^\*\.', '', domain)
-    # Strip protocol
     domain = re.sub(r'^https?://', '', domain)
-    # Strip path, port, query
     domain = domain.split('/')[0].split(':')[0].split('?')[0]
     domain = domain.strip('.')
     if not domain:
         return None
-    # Basic domain validation: must contain a dot, no spaces, only valid chars
     if '.' not in domain:
         return None
     if ' ' in domain:
@@ -143,7 +137,6 @@ def fetch_bounty_targets_domains():
     domains = set()
     base = "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data"
 
-    # Fetch domains.txt
     resp = make_request(f"{base}/domains.txt")
     if resp:
         for line in resp.text.splitlines():
@@ -152,7 +145,6 @@ def fetch_bounty_targets_domains():
                 domains.add(d)
         logger.info(f"[Bounty Targets] domains.txt: {len(domains)} domains")
 
-    # Fetch wildcards.txt
     wildcard_count = 0
     resp = make_request(f"{base}/wildcards.txt")
     if resp:
@@ -190,7 +182,6 @@ def fetch_platform_domains(platform_name, url):
                 if d:
                     domains.add(d)
                 else:
-                    # Try extracting domain from URL
                     d = extract_domain(asset_id)
                     if d:
                         d = clean_domain(d)
@@ -251,7 +242,6 @@ def fetch_chaos_domains():
                 d = clean_domain(d)
                 if d:
                     domains.add(d)
-        # Also try the name as a potential domain
         name = program.get("name", "")
         if "." in name:
             d = clean_domain(name)
@@ -266,7 +256,6 @@ def fetch_cisa_vdp_domains():
     """Source 9: Fetch CISA / .gov domain data for VDP programs."""
     domains = set()
 
-    # Fetch current federal .gov domains
     url = "https://raw.githubusercontent.com/cisagov/dotgov-data/main/current-federal.csv"
     resp = make_request(url)
     if resp:
@@ -279,7 +268,6 @@ def fetch_cisa_vdp_domains():
                     domains.add(d)
         logger.info(f"[CISA] Federal .gov domains: {len(domains)}")
 
-    # Fetch known VDP programs from CISA's published list
     vdp_url = "https://raw.githubusercontent.com/cisagov/dotgov-data/main/current-full.csv"
     resp2 = make_request(vdp_url)
     if resp2:
@@ -303,8 +291,7 @@ def fetch_google_dork_domains():
     try:
         from googlesearch import search as google_search
     except ImportError:
-        logger.warning("[Google Dorking] googlesearch-python not installed. "
-                       "Install with: pip install googlesearch-python")
+        logger.warning("[Google Dorking] googlesearch-python not installed.")
         print("    [!] googlesearch-python not installed. Skipping Google Dorking.")
         print("        Install with: pip install googlesearch-python")
         return domains
@@ -323,7 +310,6 @@ def fetch_google_dork_domains():
         except Exception as exc:
             logger.warning(f"[Google Dorking] Error searching '{dork}': {exc}")
             print(f"    [!] Error: {exc}")
-        # Rate limit between queries
         time.sleep(3)
 
     logger.info(f"[Google Dorking] Extracted {len(domains)} domains")
@@ -341,9 +327,7 @@ def _check_single_security_txt(domain):
             resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
             if resp.status_code == 200 and len(resp.text) > 10:
                 content = resp.text
-                # Check if it looks like a security.txt
                 if any(field in content for field in ("Contact:", "Policy:", "Acknowledgments:")):
-                    # Extract URLs from the content
                     urls = re.findall(r'https?://[^\s<>"\']+', content)
                     for u in urls:
                         d = extract_domain(u)
@@ -351,7 +335,6 @@ def _check_single_security_txt(domain):
                             d = clean_domain(d)
                             if d:
                                 found_domains.add(d)
-                    # The domain itself has a security program
                     found_domains.add(domain)
                     return found_domains
         except requests.exceptions.RequestException:
@@ -363,7 +346,6 @@ def _check_single_security_txt(domain):
 def fetch_security_txt_domains(seed_domains, max_workers=10, max_domains=500):
     """Source 11: Check seed domains for security.txt files."""
     domains = set()
-    # Limit the number of domains to check to avoid very long runtimes
     check_list = list(seed_domains)[:max_domains]
 
     logger.info(f"[Security.txt] Checking {len(check_list)} domains (max {max_workers} threads)")
@@ -436,13 +418,11 @@ def display_menu():
 # Main execution
 # ---------------------------------------------------------------------------
 
-def run(config=None, db_client=None, selected_sources=None, output_file="domains.txt", interactive=True):
+def run(selected_sources=None, output_file="domains.txt", interactive=True):
     """
-    Main entry point for the program extractor.
+    Main entry point.
 
     Args:
-        config: Optional framework config dict
-        db_client: Optional MongoDB client
         selected_sources: List of source IDs to use (None = show menu)
         output_file: Path to output file
         interactive: Whether to show the interactive menu
@@ -450,7 +430,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
     Returns:
         dict with results summary
     """
-    # Determine which sources to run
     if selected_sources is None:
         if interactive:
             selected_sources = display_menu()
@@ -462,7 +441,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
     all_domains = set()
     source_stats = {}
 
-    # Source 1: Bounty Targets Data
     if 1 in selected_sources:
         print("  [+] Fetching Bounty Targets Data...")
         domains = fetch_bounty_targets_domains()
@@ -470,7 +448,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Sources 2-6: Platform-specific data
     for sid in [2, 3, 4, 5, 6]:
         if sid in selected_sources:
             platform_name, url = PLATFORM_URLS[sid]
@@ -481,7 +458,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
             all_domains.update(domains)
             print(f"      Found {len(domains):,} domains")
 
-    # Source 7: Disclose.io
     if 7 in selected_sources:
         print("  [+] Fetching Disclose.io Database...")
         domains = fetch_disclose_io_domains()
@@ -489,7 +465,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Source 8: Chaos
     if 8 in selected_sources:
         print("  [+] Fetching Chaos (ProjectDiscovery)...")
         domains = fetch_chaos_domains()
@@ -497,7 +472,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Source 9: CISA VDP
     if 9 in selected_sources:
         print("  [+] Fetching CISA VDP Directory...")
         domains = fetch_cisa_vdp_domains()
@@ -505,7 +479,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Source 10: Google Dorking
     if 10 in selected_sources:
         print("  [+] Running Google Dorking...")
         domains = fetch_google_dork_domains()
@@ -513,7 +486,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Source 11: Security.txt (runs on collected domains)
     if 11 in selected_sources:
         print("  [+] Running Security.txt Scraper...")
         if all_domains:
@@ -525,15 +497,12 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
-    # Deduplicate and sort
     sorted_domains = sorted(all_domains)
 
-    # Write output
     with open(output_file, "w") as f:
         for domain in sorted_domains:
             f.write(domain + "\n")
 
-    # Print summary
     print("\n" + "=" * 65)
     print("  Summary")
     print("=" * 65)
@@ -543,23 +512,6 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
     print(f"  [+] Written to: {output_file}")
     print("=" * 65 + "\n")
 
-    # Store in MongoDB if available
-    if db_client and config:
-        try:
-            db_name = config.get('mongodb', {}).get('database', 'recon_framework')
-            db = db_client[db_name]
-            collection = db.program_discoveries
-            doc = {
-                "date": datetime.now(),
-                "total_domains": len(sorted_domains),
-                "source_stats": source_stats,
-                "output_file": os.path.abspath(output_file),
-            }
-            collection.insert_one(doc)
-            logger.info("Results stored in MongoDB")
-        except Exception as exc:
-            logger.warning(f"Failed to store results in MongoDB: {exc}")
-
     return {
         "programs_found": sorted_domains,
         "domains_checked": len(sorted_domains),
@@ -568,7 +520,7 @@ def run(config=None, db_client=None, selected_sources=None, output_file="domains
 
 
 def main():
-    """Standalone CLI entry point."""
+    """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="Bug Bounty Program Domain Extractor - Collect domains from public sources"
     )
@@ -582,15 +534,13 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler()]
     )
 
-    # Parse source selection from CLI if provided
     selected = None
     interactive = True
     if args.sources is not None:
