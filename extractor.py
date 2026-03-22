@@ -41,7 +41,7 @@ SOURCES = {
     7:  {"name": "Disclose.io Database",     "desc": "vulnerability disclosure programs"},
     8:  {"name": "Chaos (ProjectDiscovery)", "desc": "public bug bounty recon data"},
     9:  {"name": "CISA VDP Directory",       "desc": "US gov vulnerability disclosure policies"},
-    10: {"name": "Google Dorking",           "desc": "search for 'bug bounty' / 'responsible disclosure' pages"},
+    10: {"name": "Search Dorking",            "desc": "DuckDuckGo + curated program lists (ProjectDiscovery, disclose.io)"},
     11: {"name": "Security.txt Scraper",     "desc": "check domains for /.well-known/security.txt"},
 }
 
@@ -53,13 +53,15 @@ PLATFORM_URLS = {
     6: ("federacy",   "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/federacy_data.json"),
 }
 
-GOOGLE_DORKS = [
-    'inurl:"responsible-disclosure"',
-    'inurl:"bug-bounty"',
-    'intext:"vulnerability disclosure program"',
-    'inurl:"/.well-known/security.txt"',
-    'intext:"report a vulnerability" inurl:security',
+SEARCH_QUERIES = [
+    "responsible disclosure policy",
+    "bug bounty program",
+    "vulnerability disclosure program",
+    "report a vulnerability security",
+    "security.txt contact vulnerability",
+    "coordinated disclosure policy",
 ]
+
 
 SECURITY_TXT_PATHS = [
     "/.well-known/security.txt",
@@ -317,47 +319,133 @@ def fetch_cisa_vdp_domains():
     return domains
 
 
-def fetch_google_dork_domains():
-    """Source 10: Use Google dorking to discover bug bounty/disclosure pages."""
+def _ddg_html_search(query, max_results=60):
+    """Search DuckDuckGo via its HTML-only endpoint (no JS needed, no library)."""
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    }
+    params = {"q": query, "kl": "us-en"}
+    try:
+        resp = requests.get("https://html.duckduckgo.com/html/", params=params,
+                            headers=headers, timeout=20)
+        if resp.status_code == 200 and "result__a" in resp.text:
+            # Extract URLs from result snippets: <a class="result__a" href="...">
+            urls = re.findall(r'class="result__a"\s+href="([^"]+)"', resp.text)
+            for url in urls[:max_results]:
+                # DDG wraps URLs in a redirect; extract the real one
+                real = re.search(r'uddg=([^&]+)', url)
+                if real:
+                    from urllib.parse import unquote
+                    results.append(unquote(real.group(1)))
+                elif url.startswith("http"):
+                    results.append(url)
+        elif resp.status_code in (200, 202) and "anomaly" in resp.text:
+            logger.info("[DDG HTML] DuckDuckGo returned a CAPTCHA page (server IP blocked)")
+    except Exception as exc:
+        logger.warning(f"[DDG HTML] Error: {exc}")
+    return results
+
+
+def fetch_search_domains():
+    """Source 10: Search for bug bounty / disclosure pages via DuckDuckGo HTML + curated lists.
+
+    Uses DuckDuckGo's lightweight HTML endpoint (no library needed, no rate-limits)
+    plus GitHub-hosted curated security program lists as a reliable second source.
+    """
     domains = set()
 
-    try:
-        from googlesearch import search as google_search
-    except ImportError:
-        logger.warning("[Google Dorking] googlesearch-python not installed.")
-        print("    [!] googlesearch-python not installed. Skipping Google Dorking.")
-        print("        Install with: pip install googlesearch-python")
-        return domains
-
-    for dork in GOOGLE_DORKS:
-        logger.info(f"[Google Dorking] Searching: {dork}")
-        print(f"    [*] Searching: {dork}")
-        dork_count = 0
+    # --- Part A: DuckDuckGo HTML searches ---
+    print("    [*] DuckDuckGo searches...")
+    for query in SEARCH_QUERIES:
+        logger.info(f"[Search] DDG query: {query}")
+        print(f"    [*] Searching: {query}")
+        query_count = 0
         try:
-            # Consume the generator into a list to catch errors immediately
-            results = list(google_search(dork, num_results=50, sleep_interval=5))
-            logger.debug(f"[Google Dorking] Got {len(results)} raw results for: {dork}")
-            for result_url in results:
-                d = extract_domain(result_url)
+            urls = _ddg_html_search(query, max_results=80)
+            logger.debug(f"[Search] DDG returned {len(urls)} raw URLs")
+            for url in urls:
+                d = extract_domain(url)
                 if d:
                     d = clean_domain(d)
                     if d:
                         domains.add(d)
-                        dork_count += 1
-            if dork_count == 0 and len(results) == 0:
-                print(f"    [!] No results returned (Google may be rate-limiting this IP)")
+                        query_count += 1
         except Exception as exc:
-            logger.warning(f"[Google Dorking] Error searching '{dork}': {exc}")
+            logger.warning(f"[Search] DDG error for '{query}': {exc}")
             print(f"    [!] Error: {exc}")
-        print(f"        -> {dork_count} domains from this query")
-        time.sleep(5)
-
+        print(f"        -> {query_count} domains")
+        time.sleep(2)
     if not domains:
-        print("    [!] Google Dorking returned 0 domains total.")
-        print("        This usually means Google is blocking automated queries from this IP.")
-        print("        Try running from a different network or use sources 1-9 instead.")
+        print("    [!] DuckDuckGo returned 0 results (server IP may be blocked)")
+        print("        This is normal on VPS/cloud servers. Curated lists below will provide domains.")
+    else:
+        print(f"    [+] DuckDuckGo total: {len(domains)} unique domains")
 
-    logger.info(f"[Google Dorking] Extracted {len(domains)} domains")
+    # --- Part B: Curated security program lists from GitHub ---
+    print("    [*] Fetching curated security program lists...")
+    curated_count = 0
+
+    # --- B1: ProjectDiscovery public-bugbounty-programs (YAML with domain lists) ---
+    pd_url = "https://raw.githubusercontent.com/projectdiscovery/public-bugbounty-programs/main/src/data.yaml"
+    resp = make_request(pd_url)
+    if resp:
+        try:
+            # Simple YAML parser for this specific format (avoids pyyaml dependency)
+            current_domains = []
+            in_domains = False
+            for line in resp.text.splitlines():
+                if line.strip().startswith("domains:"):
+                    rest = line.strip()[len("domains:"):].strip()
+                    in_domains = rest == "" or rest == "[]"
+                    if rest == "[]":
+                        in_domains = False
+                    continue
+                if in_domains:
+                    if line.strip().startswith("- ") and not line.strip().startswith("- name:"):
+                        val = line.strip()[2:].strip()
+                        d = clean_domain(val)
+                        if d:
+                            domains.add(d)
+                            curated_count += 1
+                    else:
+                        in_domains = False
+                # Also extract domains from url fields
+                if line.strip().startswith("url:"):
+                    val = line.strip()[4:].strip()
+                    d = extract_domain(val)
+                    if d:
+                        d = clean_domain(d)
+                        if d:
+                            domains.add(d)
+                            curated_count += 1
+            logger.info(f"[Search] ProjectDiscovery YAML: processed")
+        except Exception as exc:
+            logger.warning(f"[Search] ProjectDiscovery parse error: {exc}")
+
+    # --- B2: Disclose.io program list (JSON) ---
+    dio_url = "https://raw.githubusercontent.com/disclose/diodb/master/program-list.json"
+    resp = make_request(dio_url)
+    if resp:
+        try:
+            data = resp.json()
+            if isinstance(data, list):
+                for item in data:
+                    for field in ("policy_url", "contact_url", "program_url"):
+                        val = item.get(field, "")
+                        if isinstance(val, str) and val.startswith("http"):
+                            d = extract_domain(val)
+                            if d:
+                                d = clean_domain(d)
+                                if d:
+                                    domains.add(d)
+                                    curated_count += 1
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.warning(f"[Search] Disclose.io parse error: {exc}")
+
+    print(f"    [+] Curated lists: {curated_count} entries processed")
+
+    logger.info(f"[Search] Total extracted: {len(domains)} domains")
     return domains
 
 
@@ -525,9 +613,9 @@ def run(selected_sources=None, output_file="domains.txt", interactive=True):
         print(f"      Found {len(domains):,} domains")
 
     if 10 in selected_sources:
-        print("  [+] Running Google Dorking...")
-        domains = fetch_google_dork_domains()
-        source_stats["Google Dorking"] = len(domains)
+        print("  [+] Running Search Dorking (DuckDuckGo + Common Crawl)...")
+        domains = fetch_search_domains()
+        source_stats["Search Dorking"] = len(domains)
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
