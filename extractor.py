@@ -159,7 +159,15 @@ def fetch_bounty_targets_domains():
 
 
 def fetch_platform_domains(platform_name, url):
-    """Sources 2-6: Fetch platform-specific JSON and extract in-scope domains."""
+    """Sources 2-6: Fetch platform-specific JSON and extract in-scope domains.
+
+    Each platform uses different JSON field names:
+      - HackerOne:  asset_identifier / asset_type  (WILDCARD, URL - uppercase)
+      - Bugcrowd:   target / type                   (api, website - lowercase)
+      - Intigriti:  endpoint / type                  (url, wildcard - lowercase)
+      - YesWeHack:  target / type                   (web-application, api)
+      - Federacy:   target / type                   (website)
+    """
     domains = set()
     resp = make_request(url)
     if not resp:
@@ -171,22 +179,47 @@ def fetch_platform_domains(platform_name, url):
         logger.warning(f"[{platform_name}] Failed to parse JSON")
         return domains
 
+    # Accepted asset types across all platforms (lowercase comparison)
+    VALID_TYPES = {
+        "url", "domain", "wildcard", "other", "website",
+        "api", "web-application", "web_application", "android",
+        "ios", "hardware", "smart_contract", "executable",
+    }
+
     for program in data:
         targets = program.get("targets", {})
         in_scope = targets.get("in_scope", [])
         for target in in_scope:
-            asset_type = target.get("asset_type", "").lower()
-            asset_id = target.get("asset_identifier", "")
-            if asset_type in ("url", "domain", "wildcard", "other"):
-                d = clean_domain(asset_id)
+            # Get asset type from whichever field the platform uses
+            asset_type = (
+                target.get("asset_type", "") or
+                target.get("type", "")
+            ).lower().strip()
+
+            # Get the actual target value from whichever field exists
+            asset_id = (
+                target.get("asset_identifier", "") or  # HackerOne
+                target.get("target", "") or             # Bugcrowd / YesWeHack / Federacy
+                target.get("endpoint", "") or           # Intigriti
+                target.get("uri", "")                   # Bugcrowd alt field
+            )
+
+            if not asset_id or not isinstance(asset_id, str):
+                continue
+
+            if asset_type not in VALID_TYPES:
+                continue
+
+            # Try cleaning directly first, then fall back to URL extraction
+            d = clean_domain(asset_id)
+            if d:
+                domains.add(d)
+            else:
+                d = extract_domain(asset_id)
                 if d:
-                    domains.add(d)
-                else:
-                    d = extract_domain(asset_id)
+                    d = clean_domain(d)
                     if d:
-                        d = clean_domain(d)
-                        if d:
-                            domains.add(d)
+                        domains.add(d)
 
     logger.info(f"[{platform_name}] Extracted {len(domains)} domains")
     return domains
@@ -299,18 +332,30 @@ def fetch_google_dork_domains():
     for dork in GOOGLE_DORKS:
         logger.info(f"[Google Dorking] Searching: {dork}")
         print(f"    [*] Searching: {dork}")
+        dork_count = 0
         try:
-            results = google_search(dork, num_results=50, sleep_interval=3)
+            # Consume the generator into a list to catch errors immediately
+            results = list(google_search(dork, num_results=50, sleep_interval=5))
+            logger.debug(f"[Google Dorking] Got {len(results)} raw results for: {dork}")
             for result_url in results:
                 d = extract_domain(result_url)
                 if d:
                     d = clean_domain(d)
                     if d:
                         domains.add(d)
+                        dork_count += 1
+            if dork_count == 0 and len(results) == 0:
+                print(f"    [!] No results returned (Google may be rate-limiting this IP)")
         except Exception as exc:
             logger.warning(f"[Google Dorking] Error searching '{dork}': {exc}")
             print(f"    [!] Error: {exc}")
-        time.sleep(3)
+        print(f"        -> {dork_count} domains from this query")
+        time.sleep(5)
+
+    if not domains:
+        print("    [!] Google Dorking returned 0 domains total.")
+        print("        This usually means Google is blocking automated queries from this IP.")
+        print("        Try running from a different network or use sources 1-9 instead.")
 
     logger.info(f"[Google Dorking] Extracted {len(domains)} domains")
     return domains
