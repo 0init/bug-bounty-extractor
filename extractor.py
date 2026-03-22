@@ -54,6 +54,13 @@ PLATFORM_URLS = {
 }
 
 SEARCH_QUERIES = [
+    # Direct / self-hosted programs (not on platforms) — highest priority
+    '"powered by bugcrowd" -site:bugcrowd.com',
+    '"submit vulnerability report"',
+    '"submit vulnerability report" "powered by bugcrowd" "powered by hackerone"',
+    '"submit vulnerability report" -site:hackerone.com -site:bugcrowd.com -site:synack.com -site:openbugbounty.org',
+    'inurl:/.well-known/security.txt intext:bounty -hackerone -bugcrowd -synack',
+    'intext:"CVSS score" "eligible for a reward" -hackerone -bugcrowd',
     # General bug bounty / disclosure
     "bug bounty program",
     "responsible disclosure policy",
@@ -70,13 +77,7 @@ SEARCH_QUERIES = [
     'inurl:bug-bounty',
     '"submit a vulnerability"',
     '"security bounty" program',
-    # Direct / self-hosted programs (not on platforms)
-    '"powered by bugcrowd" -site:bugcrowd.com',
-    '"submit vulnerability report"',
-    '"submit vulnerability report" -site:hackerone.com -site:bugcrowd.com -site:synack.com -site:openbugbounty.org',
     '"powered by hackerone" -site:hackerone.com',
-    'inurl:/.well-known/security.txt intext:bounty -hackerone -bugcrowd -synack',
-    'intext:"CVSS score" "eligible for a reward" -hackerone -bugcrowd',
 ]
 
 
