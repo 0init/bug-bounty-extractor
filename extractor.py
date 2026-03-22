@@ -121,7 +121,9 @@ def extract_domain(url):
         parsed = urlparse(url)
         domain = parsed.hostname
         if domain:
-            return domain.lower().strip(".")
+            domain = domain.lower().strip(".")
+            domain = re.sub(r'^www\.', '', domain)
+            return domain
     except Exception:
         pass
     return None
@@ -134,6 +136,7 @@ def clean_domain(domain):
     domain = domain.strip().lower()
     domain = re.sub(r'^\*\.', '', domain)
     domain = re.sub(r'^https?://', '', domain)
+    domain = re.sub(r'^www\.', '', domain)
     domain = domain.split('/')[0].split(':')[0].split('?')[0]
     domain = domain.strip('.')
     if not domain:
