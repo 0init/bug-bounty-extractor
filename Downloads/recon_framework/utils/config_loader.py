@@ -105,7 +105,16 @@ def load_config(config_path=None):
             except json.JSONDecodeError:
                 logger.error("Failed to parse target domains as JSON")
                 config['targets'] = {'domains': []}
-        
+
+        # Program extractor configuration
+        if 'program_extractor' in parser:
+            config['program_extractor'] = {
+                'output_file': parser.get('program_extractor', 'output_file', fallback='domains.txt'),
+                'request_timeout': int(parser.get('program_extractor', 'request_timeout', fallback='30')),
+                'security_txt_threads': int(parser.get('program_extractor', 'security_txt_threads', fallback='10')),
+                'security_txt_max_domains': int(parser.get('program_extractor', 'security_txt_max_domains', fallback='500')),
+            }
+
         logger.info(f"Successfully loaded configuration from {config_path}")
         return config
     
@@ -184,6 +193,14 @@ def load_config_from_env():
             config['targets'] = {'domains': []}
     else:
         config['targets'] = {'domains': []}
-    
+
+    # Program extractor configuration
+    config['program_extractor'] = {
+        'output_file': os.environ.get('PROGRAM_EXTRACTOR_OUTPUT_FILE', 'domains.txt'),
+        'request_timeout': int(os.environ.get('PROGRAM_EXTRACTOR_REQUEST_TIMEOUT', '30')),
+        'security_txt_threads': int(os.environ.get('PROGRAM_EXTRACTOR_SECURITY_TXT_THREADS', '10')),
+        'security_txt_max_domains': int(os.environ.get('PROGRAM_EXTRACTOR_SECURITY_TXT_MAX_DOMAINS', '500')),
+    }
+
     logger.info("Loaded configuration from environment variables")
     return config

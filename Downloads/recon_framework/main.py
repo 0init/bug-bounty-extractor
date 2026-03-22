@@ -21,6 +21,7 @@ try:
     from recon_framework.host_discovery import host_discovery
     from recon_framework.scan import vulnerability_scan
     from recon_framework.notification import notification_handler
+    from recon_framework.program_extractor import program_extraction
     from recon_framework.utils import db_handler, config_loader, config_validator
 except ImportError:
     # Fall back to relative imports (when running directly)
@@ -28,6 +29,7 @@ except ImportError:
     from host_discovery import host_discovery
     from scan import vulnerability_scan
     from notification import notification_handler
+    from program_extractor import program_extraction
     from utils import db_handler, config_loader, config_validator
 
 def setup_logging(log_level=logging.INFO):
@@ -53,7 +55,7 @@ def parse_arguments():
     
     parser.add_argument('-c', '--config', type=str, help='Path to configuration file')
     parser.add_argument('-d', '--domains', type=str, nargs='+', help='Target domains to scan')
-    parser.add_argument('-m', '--module', type=str, choices=['all', 'subdomain', 'host', 'scan', 'notify'],
+    parser.add_argument('-m', '--module', type=str, choices=['all', 'subdomain', 'host', 'scan', 'notify', 'programs'],
                         default='all', help='Specific module to run')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
     
@@ -106,12 +108,25 @@ def main():
     
     # Track results for each module
     results = {
+        'program_results': None,
         'subdomain_results': None,
         'host_results': None,
         'scan_results': None,
         'notification_results': None
     }
     
+    # Run program extraction
+    run_programs = run_all or args.module == 'programs'
+    if run_programs:
+        logger.info("Running Program Extractor Module")
+        try:
+            results['program_results'] = program_extraction.run(config, db, interactive=True)
+            logger.info(f"Program extraction completed. Found {len(results['program_results'].get('programs_found', []))} domains.")
+        except Exception as e:
+            logger.error(f"Error in Program Extractor Module: {str(e)}")
+            if not run_all:
+                sys.exit(1)
+
     # Run subdomain enumeration
     if run_subdomain:
         logger.info("Running Subdomain Enumeration Module")
@@ -159,6 +174,8 @@ def main():
     # Print summary
     logger.info("Reconnaissance framework execution completed")
     logger.info("Summary:")
+    if results['program_results']:
+        logger.info(f"- Program domains found: {len(results['program_results'].get('programs_found', []))}")
     if results['subdomain_results']:
         logger.info(f"- New subdomains: {len(results['subdomain_results'].get('new_subdomains', []))}")
     if results['host_results']:

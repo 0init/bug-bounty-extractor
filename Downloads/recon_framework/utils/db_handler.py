@@ -58,7 +58,11 @@ def initialize_db(config):
         if 'notifications' not in db.list_collection_names():
             db.create_collection('notifications')
             logger.info("Created 'notifications' collection")
-        
+
+        if 'program_discoveries' not in db.list_collection_names():
+            db.create_collection('program_discoveries')
+            logger.info("Created 'program_discoveries' collection")
+
         return client
     
     except (ConnectionFailure, ServerSelectionTimeoutError) as e:
