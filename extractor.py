@@ -17,6 +17,7 @@ import re
 import csv
 import io
 import json
+import random
 import time
 import logging
 import argparse
@@ -340,92 +341,168 @@ def fetch_cisa_vdp_domains():
     return domains
 
 
-def _brave_search(query, pages=3):
-    """Search Brave and extract result URLs. Works reliably from VPS/server IPs."""
-    domains = set()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    # Domains to skip (search engines, CDNs, not real targets)
-    SKIP_DOMAINS = {
-        "brave.com", "google.com", "bing.com", "youtube.com",
-        "wikipedia.org", "reddit.com", "twitter.com", "x.com",
-        "facebook.com", "linkedin.com", "github.com", "medium.com",
-    }
+# Domains to skip (search engines, CDNs, not real targets)
+SKIP_DOMAINS = {
+    "brave.com", "search.brave.com", "google.com", "bing.com",
+    "youtube.com", "wikipedia.org", "reddit.com", "twitter.com",
+    "x.com", "facebook.com", "linkedin.com", "github.com",
+    "medium.com", "yahoo.com", "mojeek.com",
+}
 
-    for page in range(pages):
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+]
+
+
+def _extract_and_clean(urls):
+    """Extract clean domains from a list of URLs, filtering noise."""
+    domains = set()
+    for url in urls:
+        d = extract_domain(url)
+        if d:
+            d = clean_domain(d)
+            if d and d not in SKIP_DOMAINS:
+                domains.add(d)
+    return domains
+
+
+def _search_brave(query, session):
+    """Search Brave and extract result URLs."""
+    domains = set()
+    for page in range(3):
         offset = page * 10
         try:
-            resp = requests.get(
+            resp = session.get(
                 "https://search.brave.com/search",
                 params={"q": query, "source": "web", "offset": offset},
-                headers=headers, timeout=15,
+                timeout=15,
             )
             if resp.status_code == 429:
                 logger.info(f"[Brave] Rate-limited on '{query}' offset={offset}")
-                return domains  # Return what we have, signal caller to back off
+                return domains, True  # rate_limited=True
             if resp.status_code != 200:
-                logger.warning(f"[Brave] HTTP {resp.status_code} for '{query}' offset={offset}")
                 break
-            # Brave puts result URLs inside snippet containers
             urls = re.findall(
                 r'class="snippet[^"]*"[^>]*>.*?href="(https?://[^"]+)"',
                 resp.text, re.DOTALL,
             )
             if not urls:
-                break  # No more results
-            for url in urls:
-                d = extract_domain(url)
-                if d:
-                    d = clean_domain(d)
-                    if d and d not in SKIP_DOMAINS:
-                        domains.add(d)
+                break
+            domains.update(_extract_and_clean(urls))
         except Exception as exc:
-            logger.warning(f"[Brave] Error for '{query}': {exc}")
+            logger.warning(f"[Brave] Error: {exc}")
             break
         time.sleep(3)
+    return domains, False
 
-    return domains
+
+def _search_mojeek(query):
+    """Search Mojeek (independent search engine, VPS-friendly)."""
+    domains = set()
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    try:
+        resp = requests.get(
+            "https://www.mojeek.com/search",
+            params={"q": query},
+            headers=headers, timeout=15,
+        )
+        if resp.status_code == 200:
+            urls = re.findall(r'href="(https?://(?!.*mojeek)[^"]{15,})"', resp.text)
+            urls = [u for u in urls if not any(x in u for x in
+                    [".css", ".js", ".png", ".svg", ".woff", "cdn.", "static."])]
+            domains.update(_extract_and_clean(urls))
+    except Exception as exc:
+        logger.warning(f"[Mojeek] Error: {exc}")
+    return domains, False
+
+
+def _search_yahoo(query, session):
+    """Search Yahoo (powered by Bing, VPS-friendly with consent cookie)."""
+    domains = set()
+    from urllib.parse import unquote
+    try:
+        resp = session.get(
+            "https://search.yahoo.com/search",
+            params={"p": query, "n": 20},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            # Yahoo wraps URLs through redirect: RU=<encoded_url>
+            encoded_urls = re.findall(r'RU=([^"&/]+)', resp.text)
+            for encoded in encoded_urls:
+                url = unquote(unquote(encoded))
+                if url.startswith("http"):
+                    domains.update(_extract_and_clean([url]))
+    except Exception as exc:
+        logger.warning(f"[Yahoo] Error: {exc}")
+    return domains, False
 
 
 def fetch_search_domains():
-    """Source 10: Search the internet for bug bounty / disclosure pages via Brave Search.
+    """Source 10: Search the internet for bug bounty / disclosure pages.
 
-    Brave Search works reliably from VPS/server IPs (unlike Google and DuckDuckGo
-    which block datacenter IPs with CAPTCHAs). Runs multiple targeted queries with
-    pagination to discover domains that have bug bounty programs or security.txt.
+    Rotates queries across 3 search engines (Brave, Mojeek, Yahoo) to avoid
+    rate-limiting. Each engine only gets ~1/3 of total queries. If one engine
+    gets rate-limited, its queries are redistributed to the others.
     """
     domains = set()
 
+    # --- Setup sessions ---
+    brave_session = requests.Session()
+    brave_session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    # Warm up Brave with homepage visit for cookies
+    try:
+        brave_session.get("https://search.brave.com/", timeout=10)
+    except Exception:
+        pass
+
+    yahoo_session = requests.Session()
+    yahoo_session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    yahoo_session.cookies.set("EuConsent", "true", domain=".yahoo.com")
+
+    engines = [
+        ("Brave",  lambda q: _search_brave(q, brave_session)),
+        ("Mojeek", lambda q: _search_mojeek(q)),
+        ("Yahoo",  lambda q: _search_yahoo(q, yahoo_session)),
+    ]
+    active_engines = list(engines)  # Engines that haven't been rate-limited
+
     total_queries = len(SEARCH_QUERIES)
-    print(f"    [*] Brave Search ({total_queries} queries x 3 pages each)...")
-    delay = 5  # Start with 5s between queries
-    rate_limited = False
+    print(f"    [*] Multi-engine search ({total_queries} queries across Brave + Mojeek + Yahoo)...")
 
     for i, query in enumerate(SEARCH_QUERIES, 1):
-        logger.info(f"[Search] Brave query {i}/{total_queries}: {query}")
-        print(f"    [{i:>2}/{total_queries}] {query}")
+        if not active_engines:
+            print("    [!] All engines rate-limited. Stopping.")
+            break
+
+        # Pick engine via round-robin on active engines
+        engine_name, search_fn = active_engines[i % len(active_engines)]
+
+        logger.info(f"[Search] [{engine_name}] query {i}/{total_queries}: {query}")
+        print(f"    [{i:>2}/{total_queries}] [{engine_name:6}] {query}")
+
         before = len(domains)
         try:
-            found = _brave_search(query, pages=3)
+            found, rate_limited = search_fn(query)
             domains.update(found)
             new = len(domains) - before
             print(f"           -> {len(found)} domains ({new} new)")
 
-            if len(found) == 0 and not rate_limited:
-                # Likely rate-limited, increase delay
-                rate_limited = True
-                delay = 15
-                print(f"    [!] Rate-limited by Brave. Waiting {delay}s between queries...")
-            elif len(found) > 0:
-                rate_limited = False
-                delay = 5
+            if rate_limited:
+                print(f"    [!] {engine_name} rate-limited. Removing from rotation.")
+                active_engines = [e for e in active_engines if e[0] != engine_name]
         except Exception as exc:
             logger.warning(f"[Search] Error for '{query}': {exc}")
             print(f"           -> error: {exc}")
-        time.sleep(delay)
+
+        time.sleep(random.uniform(3, 6))
 
     logger.info(f"[Search] Total extracted: {len(domains)} domains")
     return domains
