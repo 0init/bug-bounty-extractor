@@ -44,6 +44,7 @@ SOURCES = {
     9:  {"name": "CISA VDP Directory",       "desc": "US gov vulnerability disclosure policies"},
     10: {"name": "Search Dorking",            "desc": "Brave Search for bug bounty / disclosure / security.txt pages"},
     11: {"name": "Security.txt Scraper",     "desc": "check domains for /.well-known/security.txt"},
+    12: {"name": "FireBounty",               "desc": "firebounty.com VDP + bug bounty aggregator (~176k programs)"},
 }
 
 PLATFORM_URLS = {
@@ -560,6 +561,85 @@ def fetch_security_txt_domains(seed_domains, max_workers=10, max_domains=500):
     return domains
 
 
+def fetch_firebounty_domains(max_pages=200):
+    """Source 12: Scrape firebounty.com for VDP and bug bounty program domains.
+
+    FireBounty aggregates ~176k programs. Program titles are actual domain names.
+    Scrapes pages in parallel (5 threads) for speed.
+    """
+    domains = set()
+    headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
+
+    def _fetch_page(page_num):
+        """Fetch a single page and extract domain titles."""
+        page_domains = []
+        try:
+            resp = requests.get(
+                f"https://firebounty.com/?page={page_num}",
+                headers=headers, timeout=60,
+            )
+            if resp.status_code == 200:
+                matches = re.findall(
+                    r'href="/(\d+-[^"]+)"[^>]*>\s*([^<]+?)\s*</a>',
+                    resp.text,
+                )
+                seen = set()
+                for slug, title in matches:
+                    title = title.strip()
+                    if slug not in seen and "." in title:
+                        seen.add(slug)
+                        d = clean_domain(title)
+                        if d:
+                            page_domains.append(d)
+        except Exception as exc:
+            logger.warning(f"[FireBounty] Error on page {page_num}: {exc}")
+        return page_domains
+
+    # Detect total pages from page 1
+    logger.info(f"[FireBounty] Fetching up to {max_pages} pages (5 threads)...")
+    print(f"    [*] Scraping firebounty.com (up to {max_pages} pages, 5 threads)...")
+
+    try:
+        resp = requests.get("https://firebounty.com/?page=1", headers=headers, timeout=60)
+        page_nums = re.findall(r'page=(\d+)', resp.text)
+        if page_nums:
+            total_pages = min(int(max(page_nums, key=int)), max_pages)
+        else:
+            total_pages = max_pages
+        logger.info(f"[FireBounty] Total pages detected: {total_pages}")
+
+        # Extract page 1 domains while we have it
+        matches = re.findall(r'href="/(\d+-[^"]+)"[^>]*>\s*([^<]+?)\s*</a>', resp.text)
+        seen = set()
+        for slug, title in matches:
+            title = title.strip()
+            if slug not in seen and "." in title:
+                seen.add(slug)
+                d = clean_domain(title)
+                if d:
+                    domains.add(d)
+    except Exception as exc:
+        logger.warning(f"[FireBounty] Error fetching page 1: {exc}")
+        total_pages = max_pages
+
+    # Fetch remaining pages in parallel
+    fetched = 1
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_fetch_page, p): p
+            for p in range(2, total_pages + 1)
+        }
+        for future in as_completed(futures):
+            fetched += 1
+            page_domains = future.result()
+            domains.update(page_domains)
+            if fetched % 50 == 0:
+                print(f"    [*] Scraped {fetched}/{total_pages} pages ({len(domains):,} domains)...")
+
+    logger.info(f"[FireBounty] Extracted {len(domains)} domains from {fetched} pages")
+    return domains
+
+
 # ---------------------------------------------------------------------------
 # Interactive menu
 # ---------------------------------------------------------------------------
@@ -686,6 +766,13 @@ def run(selected_sources=None, output_file="domains.txt", interactive=True):
             print("    [!] No seed domains available. Skipping security.txt check.")
             domains = set()
         source_stats["Security.txt Scraper"] = len(domains)
+        all_domains.update(domains)
+        print(f"      Found {len(domains):,} domains")
+
+    if 12 in selected_sources:
+        print("  [+] Fetching FireBounty programs...")
+        domains = fetch_firebounty_domains(max_pages=200)
+        source_stats["FireBounty"] = len(domains)
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
 
