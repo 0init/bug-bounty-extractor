@@ -650,23 +650,37 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
         return page_domains
 
     def _fetch_program_domains(slug):
-        """Visit a single program detail page and extract scope domains/URLs."""
+        """Visit a single program detail page and extract scope domains/URLs.
+        Retries up to 3 times with backoff on failure/rate-limiting."""
         prog_domains = set()
-        try:
-            resp = requests.get(
-                f"https://firebounty.com/{slug}",
-                headers=fb_headers, timeout=30,
-            )
-            if resp.status_code == 200:
-                urls = re.findall(r'https?://[a-zA-Z0-9._-]+\.[a-z]{2,}', resp.text)
-                for u in urls:
-                    d = extract_domain(u)
-                    if d:
-                        d = clean_domain(d)
-                        if d and d not in SKIP_DOMAINS:
-                            prog_domains.add(d)
-        except Exception as exc:
-            logger.debug(f"[FireBounty] Error on program {slug}: {exc}")
+        for attempt in range(3):
+            try:
+                # Small per-request delay to avoid overwhelming the server
+                time.sleep(random.uniform(0.3, 0.8))
+                resp = requests.get(
+                    f"https://firebounty.com/{slug}",
+                    headers=fb_headers, timeout=30,
+                )
+                if resp.status_code == 200:
+                    urls = re.findall(r'https?://[a-zA-Z0-9._-]+\.[a-z]{2,}', resp.text)
+                    for u in urls:
+                        d = extract_domain(u)
+                        if d:
+                            d = clean_domain(d)
+                            if d and d not in SKIP_DOMAINS:
+                                prog_domains.add(d)
+                    return prog_domains
+                elif resp.status_code == 429:
+                    wait = (attempt + 1) * 5
+                    logger.info(f"[FireBounty] Rate-limited on {slug}, waiting {wait}s (attempt {attempt+1}/3)")
+                    time.sleep(wait)
+                else:
+                    logger.debug(f"[FireBounty] HTTP {resp.status_code} on {slug}")
+                    return prog_domains
+            except Exception as exc:
+                wait = (attempt + 1) * 3
+                logger.debug(f"[FireBounty] Error on {slug} (attempt {attempt+1}/3): {exc}")
+                time.sleep(wait)
         return prog_domains
 
     # --- Detect total pages ---
@@ -694,18 +708,26 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
         all_slugs = list(dict.fromkeys(all_slugs))
         print(f"    [*] Found {len(all_slugs)} bounty programs. Extracting scope domains...")
 
-        # Visit each program detail page in parallel
+        # Visit each program detail page in parallel (3 threads to avoid rate-limits)
         checked = 0
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        failed = 0
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {executor.submit(_fetch_program_domains, s): s for s in all_slugs}
             for future in as_completed(futures):
                 checked += 1
                 prog_domains = future.result()
+                if not prog_domains:
+                    failed += 1
                 domains.update(prog_domains)
-                if checked % 10 == 0:
-                    print(f"    [*] Checked {checked}/{len(all_slugs)} programs ({len(domains):,} domains)...")
+                if checked % 20 == 0:
+                    print(f"    [*] Checked {checked}/{len(all_slugs)} programs "
+                          f"({len(domains):,} domains, {failed} empty)...")
 
-        logger.info(f"[FireBounty] Bounty mode: {len(domains)} domains from {len(all_slugs)} programs")
+        if failed > len(all_slugs) * 0.5:
+            print(f"    [!] Warning: {failed}/{len(all_slugs)} programs returned 0 domains.")
+            print(f"        FireBounty may have rate-limited your IP. Try again later or")
+            print(f"        use fewer threads by editing max_workers in the script.")
+        logger.info(f"[FireBounty] Bounty mode: {len(domains)} domains from {len(all_slugs)} programs ({failed} empty)")
     else:
         # --- DEFAULT MODE: extract domain titles from listing pages ---
         print(f"    [*] Scraping firebounty.com ({total_pages} pages, 5 threads)...")
