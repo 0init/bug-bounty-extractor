@@ -592,22 +592,45 @@ def fetch_security_txt_domains(seed_domains, max_workers=10, max_domains=500):
 def fetch_firebounty_domains(max_pages=200, bounty_only=False):
     """Source 12: Scrape firebounty.com for VDP and bug bounty program domains.
 
-    FireBounty aggregates ~176k programs. Program titles are actual domain names.
-    Scrapes pages in parallel (5 threads) for speed.
-    If bounty_only=True, uses reward=Reward filter (paid programs only).
+    FireBounty aggregates ~176k programs. Two modes:
+    - Default: scrape listing pages (program titles are domain names for VDP/security.txt entries)
+    - bounty_only: scrape listing + visit each program detail page to extract scope domains
+      (bounty programs have names like "PADDLE.COM BUG BOUNTY PROGRAM", not raw domains)
     """
     domains = set()
-    headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
-    # type=Bounty filters for actual bug bounty programs (not just VDP/security.txt)
+    fb_headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
     bounty_param = "&type=Bounty" if bounty_only else ""
 
-    def _fetch_page(page_num):
-        """Fetch a single page and extract domain titles."""
+    # Domains to skip when scraping program detail pages
+    SKIP_DOMAINS = {
+        "firebounty.com", "yeswehack.com", "hackerone.com", "bugcrowd.com",
+        "twitter.com", "x.com", "github.com", "linkedin.com", "facebook.com",
+        "youtube.com", "wikipedia.org", "mozilla.org", "matomo.cloud",
+        "zerodisclo.com",
+    }
+
+    def _extract_program_slugs(page_num):
+        """Fetch a listing page and return program slugs."""
+        slugs = []
+        try:
+            resp = requests.get(
+                f"https://firebounty.com/?page={page_num}{bounty_param}",
+                headers=fb_headers, timeout=60,
+            )
+            if resp.status_code == 200:
+                matches = re.findall(r'href="/(\d+-[^"]+)"', resp.text)
+                slugs = list(dict.fromkeys(matches))  # dedupe
+        except Exception as exc:
+            logger.warning(f"[FireBounty] Error on listing page {page_num}: {exc}")
+        return slugs
+
+    def _fetch_listing_domains(page_num):
+        """Fetch a listing page and extract domain names from program titles."""
         page_domains = []
         try:
             resp = requests.get(
                 f"https://firebounty.com/?page={page_num}{bounty_param}",
-                headers=headers, timeout=60,
+                headers=fb_headers, timeout=60,
             )
             if resp.status_code == 200:
                 matches = re.findall(
@@ -626,20 +649,68 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
             logger.warning(f"[FireBounty] Error on page {page_num}: {exc}")
         return page_domains
 
-    # Detect total pages from page 1
-    logger.info(f"[FireBounty] Fetching up to {max_pages} pages (5 threads)...")
-    print(f"    [*] Scraping firebounty.com (up to {max_pages} pages, 5 threads)...")
+    def _fetch_program_domains(slug):
+        """Visit a single program detail page and extract scope domains/URLs."""
+        prog_domains = set()
+        try:
+            resp = requests.get(
+                f"https://firebounty.com/{slug}",
+                headers=fb_headers, timeout=30,
+            )
+            if resp.status_code == 200:
+                urls = re.findall(r'https?://[a-zA-Z0-9._-]+\.[a-z]{2,}', resp.text)
+                for u in urls:
+                    d = extract_domain(u)
+                    if d:
+                        d = clean_domain(d)
+                        if d and d not in SKIP_DOMAINS:
+                            prog_domains.add(d)
+        except Exception as exc:
+            logger.debug(f"[FireBounty] Error on program {slug}: {exc}")
+        return prog_domains
 
+    # --- Detect total pages ---
     try:
-        resp = requests.get(f"https://firebounty.com/?page=1{bounty_param}", headers=headers, timeout=60)
+        resp = requests.get(
+            f"https://firebounty.com/?page=1{bounty_param}",
+            headers=fb_headers, timeout=60,
+        )
         page_nums = re.findall(r'page=(\d+)', resp.text)
-        if page_nums:
-            total_pages = min(int(max(page_nums, key=int)), max_pages)
-        else:
-            total_pages = max_pages
-        logger.info(f"[FireBounty] Total pages detected: {total_pages}")
+        total_pages = min(int(max(page_nums, key=int)), max_pages) if page_nums else max_pages
+    except Exception as exc:
+        logger.warning(f"[FireBounty] Error fetching page 1: {exc}")
+        total_pages = max_pages
 
-        # Extract page 1 domains while we have it
+    logger.info(f"[FireBounty] Total pages: {total_pages}, bounty_only={bounty_only}")
+
+    if bounty_only:
+        # --- BOUNTY MODE: collect slugs, then visit each program page ---
+        print(f"    [*] Collecting bounty program URLs ({total_pages} listing pages)...")
+
+        all_slugs = []
+        for page in range(1, total_pages + 1):
+            slugs = _extract_program_slugs(page)
+            all_slugs.extend(slugs)
+        all_slugs = list(dict.fromkeys(all_slugs))
+        print(f"    [*] Found {len(all_slugs)} bounty programs. Extracting scope domains...")
+
+        # Visit each program detail page in parallel
+        checked = 0
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_program_domains, s): s for s in all_slugs}
+            for future in as_completed(futures):
+                checked += 1
+                prog_domains = future.result()
+                domains.update(prog_domains)
+                if checked % 10 == 0:
+                    print(f"    [*] Checked {checked}/{len(all_slugs)} programs ({len(domains):,} domains)...")
+
+        logger.info(f"[FireBounty] Bounty mode: {len(domains)} domains from {len(all_slugs)} programs")
+    else:
+        # --- DEFAULT MODE: extract domain titles from listing pages ---
+        print(f"    [*] Scraping firebounty.com ({total_pages} pages, 5 threads)...")
+
+        # Extract page 1 while we have it
         matches = re.findall(r'href="/(\d+-[^"]+)"[^>]*>\s*([^<]+?)\s*</a>', resp.text)
         seen = set()
         for slug, title in matches:
@@ -649,25 +720,23 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
                 d = clean_domain(title)
                 if d:
                     domains.add(d)
-    except Exception as exc:
-        logger.warning(f"[FireBounty] Error fetching page 1: {exc}")
-        total_pages = max_pages
 
-    # Fetch remaining pages in parallel
-    fetched = 1
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(_fetch_page, p): p
-            for p in range(2, total_pages + 1)
-        }
-        for future in as_completed(futures):
-            fetched += 1
-            page_domains = future.result()
-            domains.update(page_domains)
-            if fetched % 50 == 0:
-                print(f"    [*] Scraped {fetched}/{total_pages} pages ({len(domains):,} domains)...")
+        # Fetch remaining pages in parallel
+        fetched = 1
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_fetch_listing_domains, p): p
+                for p in range(2, total_pages + 1)
+            }
+            for future in as_completed(futures):
+                fetched += 1
+                page_domains = future.result()
+                domains.update(page_domains)
+                if fetched % 50 == 0:
+                    print(f"    [*] Scraped {fetched}/{total_pages} pages ({len(domains):,} domains)...")
 
-    logger.info(f"[FireBounty] Extracted {len(domains)} domains from {fetched} pages")
+        logger.info(f"[FireBounty] Default mode: {len(domains)} domains from {fetched} pages")
+
     return domains
 
 
