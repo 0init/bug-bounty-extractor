@@ -598,14 +598,15 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
     """
     domains = set()
     headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
-    reward_param = "&reward=Reward" if bounty_only else ""
+    # type=Bounty filters for actual bug bounty programs (not just VDP/security.txt)
+    bounty_param = "&type=Bounty" if bounty_only else ""
 
     def _fetch_page(page_num):
         """Fetch a single page and extract domain titles."""
         page_domains = []
         try:
             resp = requests.get(
-                f"https://firebounty.com/?page={page_num}{reward_param}",
+                f"https://firebounty.com/?page={page_num}{bounty_param}",
                 headers=headers, timeout=60,
             )
             if resp.status_code == 200:
@@ -630,7 +631,7 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
     print(f"    [*] Scraping firebounty.com (up to {max_pages} pages, 5 threads)...")
 
     try:
-        resp = requests.get(f"https://firebounty.com/?page=1{reward_param}", headers=headers, timeout=60)
+        resp = requests.get(f"https://firebounty.com/?page=1{bounty_param}", headers=headers, timeout=60)
         page_nums = re.findall(r'page=(\d+)', resp.text)
         if page_nums:
             total_pages = min(int(max(page_nums, key=int)), max_pages)
