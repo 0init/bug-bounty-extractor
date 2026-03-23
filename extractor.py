@@ -183,7 +183,7 @@ def fetch_bounty_targets_domains():
     return domains
 
 
-def fetch_platform_domains(platform_name, url):
+def fetch_platform_domains(platform_name, url, bounty_only=False):
     """Sources 2-6: Fetch platform-specific JSON and extract in-scope domains.
 
     Each platform uses different JSON field names:
@@ -192,6 +192,8 @@ def fetch_platform_domains(platform_name, url):
       - Intigriti:  endpoint / type                  (url, wildcard - lowercase)
       - YesWeHack:  target / type                   (web-application, api)
       - Federacy:   target / type                   (website)
+
+    If bounty_only=True, only include programs that offer monetary rewards.
     """
     domains = set()
     resp = make_request(url)
@@ -211,7 +213,30 @@ def fetch_platform_domains(platform_name, url):
         "ios", "hardware", "smart_contract", "executable",
     }
 
+    skipped = 0
     for program in data:
+        # Bounty-only filter: skip programs that don't pay
+        if bounty_only:
+            has_bounty = False
+            # HackerOne: offers_bounties (bool)
+            if program.get("offers_bounties"):
+                has_bounty = True
+            # Bugcrowd: max_payout > 0
+            elif (program.get("max_payout") or 0) > 0:
+                has_bounty = True
+            # Intigriti: max_bounty.value > 0
+            elif isinstance(program.get("max_bounty"), dict) and (program["max_bounty"].get("value") or 0) > 0:
+                has_bounty = True
+            # YesWeHack: max_bounty > 0 (int)
+            elif isinstance(program.get("max_bounty"), (int, float)) and program["max_bounty"] > 0:
+                has_bounty = True
+            # Federacy: offers_awards (bool)
+            elif program.get("offers_awards"):
+                has_bounty = True
+            if not has_bounty:
+                skipped += 1
+                continue
+
         targets = program.get("targets", {})
         in_scope = targets.get("in_scope", [])
         for target in in_scope:
@@ -246,7 +271,10 @@ def fetch_platform_domains(platform_name, url):
                     if d:
                         domains.add(d)
 
-    logger.info(f"[{platform_name}] Extracted {len(domains)} domains")
+    if bounty_only:
+        logger.info(f"[{platform_name}] Extracted {len(domains)} domains (bounty-only, skipped {skipped} non-paying)")
+    else:
+        logger.info(f"[{platform_name}] Extracted {len(domains)} domains")
     return domains
 
 
@@ -561,21 +589,23 @@ def fetch_security_txt_domains(seed_domains, max_workers=10, max_domains=500):
     return domains
 
 
-def fetch_firebounty_domains(max_pages=200):
+def fetch_firebounty_domains(max_pages=200, bounty_only=False):
     """Source 12: Scrape firebounty.com for VDP and bug bounty program domains.
 
     FireBounty aggregates ~176k programs. Program titles are actual domain names.
     Scrapes pages in parallel (5 threads) for speed.
+    If bounty_only=True, uses reward=Reward filter (paid programs only).
     """
     domains = set()
     headers = {"User-Agent": "BugBountyExtractor/1.0 (security-research)"}
+    reward_param = "&reward=Reward" if bounty_only else ""
 
     def _fetch_page(page_num):
         """Fetch a single page and extract domain titles."""
         page_domains = []
         try:
             resp = requests.get(
-                f"https://firebounty.com/?page={page_num}",
+                f"https://firebounty.com/?page={page_num}{reward_param}",
                 headers=headers, timeout=60,
             )
             if resp.status_code == 200:
@@ -600,7 +630,7 @@ def fetch_firebounty_domains(max_pages=200):
     print(f"    [*] Scraping firebounty.com (up to {max_pages} pages, 5 threads)...")
 
     try:
-        resp = requests.get("https://firebounty.com/?page=1", headers=headers, timeout=60)
+        resp = requests.get(f"https://firebounty.com/?page=1{reward_param}", headers=headers, timeout=60)
         page_nums = re.findall(r'page=(\d+)', resp.text)
         if page_nums:
             total_pages = min(int(max(page_nums, key=int)), max_pages)
@@ -690,7 +720,7 @@ def display_menu():
 # Main execution
 # ---------------------------------------------------------------------------
 
-def run(selected_sources=None, output_file="domains.txt", interactive=True):
+def run(selected_sources=None, output_file="domains.txt", interactive=True, bounty_only=False):
     """
     Main entry point.
 
@@ -710,6 +740,9 @@ def run(selected_sources=None, output_file="domains.txt", interactive=True):
 
     print(f"\n  [*] Running {len(selected_sources)} source(s)...\n")
 
+    if bounty_only:
+        print("  [!] Bounty-only mode: filtering for programs that pay rewards\n")
+
     all_domains = set()
     source_stats = {}
 
@@ -725,7 +758,7 @@ def run(selected_sources=None, output_file="domains.txt", interactive=True):
             platform_name, url = PLATFORM_URLS[sid]
             display_name = SOURCES[sid]["name"]
             print(f"  [+] Fetching {display_name}...")
-            domains = fetch_platform_domains(platform_name, url)
+            domains = fetch_platform_domains(platform_name, url, bounty_only=bounty_only)
             source_stats[display_name] = len(domains)
             all_domains.update(domains)
             print(f"      Found {len(domains):,} domains")
@@ -771,7 +804,7 @@ def run(selected_sources=None, output_file="domains.txt", interactive=True):
 
     if 12 in selected_sources:
         print("  [+] Fetching FireBounty programs...")
-        domains = fetch_firebounty_domains(max_pages=200)
+        domains = fetch_firebounty_domains(max_pages=200, bounty_only=bounty_only)
         source_stats["FireBounty"] = len(domains)
         all_domains.update(domains)
         print(f"      Found {len(domains):,} domains")
@@ -810,6 +843,8 @@ def main():
                              "Use 0 for all. Skips interactive menu.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable verbose logging")
+    parser.add_argument("-b", "--bounty-only", action="store_true",
+                        help="Only extract programs that offer monetary bounties/rewards")
 
     args = parser.parse_args()
 
@@ -835,7 +870,8 @@ def main():
             print("[!] Invalid --sources value. Use comma-separated numbers.")
             sys.exit(1)
 
-    run(selected_sources=selected, output_file=args.output, interactive=interactive)
+    run(selected_sources=selected, output_file=args.output, interactive=interactive,
+        bounty_only=args.bounty_only)
 
 
 if __name__ == "__main__":
