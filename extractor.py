@@ -683,17 +683,20 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
                 time.sleep(wait)
         return prog_domains
 
-    # --- Detect total pages ---
+    # --- Detect total pages (with early IP-block detection) ---
     try:
         resp = requests.get(
             f"https://firebounty.com/?page=1{bounty_param}",
-            headers=fb_headers, timeout=60,
+            headers=fb_headers, timeout=20,
         )
         page_nums = re.findall(r'page=(\d+)', resp.text)
         total_pages = min(int(max(page_nums, key=int)), max_pages) if page_nums else max_pages
     except Exception as exc:
-        logger.warning(f"[FireBounty] Error fetching page 1: {exc}")
-        total_pages = max_pages
+        print(f"    [!] Cannot reach firebounty.com (IP may be blocked): {type(exc).__name__}")
+        print(f"        Skipping FireBounty. Your IP will be unblocked after a few hours.")
+        print(f"        Meanwhile, use sources 1-9 which have the same bounty programs.")
+        logger.warning(f"[FireBounty] Cannot reach site: {exc}")
+        return domains
 
     logger.info(f"[FireBounty] Total pages: {total_pages}, bounty_only={bounty_only}")
 
@@ -702,9 +705,18 @@ def fetch_firebounty_domains(max_pages=200, bounty_only=False):
         print(f"    [*] Collecting bounty program URLs ({total_pages} listing pages)...")
 
         all_slugs = []
+        consecutive_failures = 0
         for page in range(1, total_pages + 1):
             slugs = _extract_program_slugs(page)
-            all_slugs.extend(slugs)
+            if slugs:
+                all_slugs.extend(slugs)
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    print(f"    [!] 3 consecutive listing pages failed (page {page}). "
+                          f"FireBounty may be rate-limiting. Stopping collection.")
+                    break
         all_slugs = list(dict.fromkeys(all_slugs))
         print(f"    [*] Found {len(all_slugs)} bounty programs. Extracting scope domains...")
 
